@@ -3,8 +3,8 @@ import { calculateDistance, Guard, PatrolLocation } from '../utils';
 import { logPatrolToSheet, uploadImageToDrive, PatrolLog } from '../api';
 import { ShieldAlert, CheckCircle, Upload, Camera, QrCode } from 'lucide-react';
 import { format, parse, differenceInMinutes, isValid } from 'date-fns';
-import { Scanner as QrScanner } from '@yudiel/react-qr-scanner';
 import Webcam from 'react-webcam';
+import jsQR from 'jsqr';
 
 const CustomWebcam = Webcam as any;
 
@@ -19,7 +19,12 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
   
   const [selectedMainLoc, setSelectedMainLoc] = useState<string>('');
   const [selectedSubLoc, setSelectedSubLoc] = useState<string>('');
-  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [photoFile, setPhotoFileState] = useState<File | null>(null);
+  const photoFileRef = useRef<File | null>(null);
+  const setPhotoFile = (file: File | null) => {
+    setPhotoFileState(file);
+    photoFileRef.current = file;
+  };
   const [activeTab, setActiveTab] = useState<'scan' | 'ticket'>('scan');
   const [incidentType, setIncidentType] = useState('Damage');
   const [incidentDesc, setIncidentDesc] = useState('');
@@ -47,6 +52,53 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
     }
   }, []);
 
+  // Real-time camera QR scanning loop using jsQR
+  useEffect(() => {
+    if (cameraMode !== 'qr') return;
+    let active = true;
+    let timerId: any = null;
+
+    const scanFrame = () => {
+      if (!active) return;
+      
+      try {
+        const video = webcamRef.current?.video;
+        if (video && video.readyState === video.HAVE_ENOUGH_DATA) {
+          const canvas = document.createElement('canvas');
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const qrCode = jsQR(imageData.data, imageData.width, imageData.height, {
+              inversionAttempts: "dontInvert"
+            });
+            if (qrCode && qrCode.data) {
+              console.log("QR Code Decoded in real-time camera loop:", qrCode.data);
+              handleScan(qrCode.data);
+              active = false;
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("QR frame scan error:", err);
+      }
+
+      if (active) {
+        timerId = setTimeout(scanFrame, 300); // Check 3 times per second
+      }
+    };
+
+    timerId = setTimeout(scanFrame, 600); // Small initial delay to warm up video
+
+    return () => {
+      active = false;
+      if (timerId) clearTimeout(timerId);
+    };
+  }, [cameraMode, selectedSubLoc, selectedMainLoc, logStatus]);
+
   const capturePhoto = useCallback(() => {
     const imageSrc = webcamRef.current?.getScreenshot();
     if (imageSrc) {
@@ -60,14 +112,45 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
     }
   }, [webcamRef]);
 
-  const handleScan = async (result: any) => {
-    if (!result || !result[0] || logStatus === 'logging') return;
+  const getLatestUserLocation = (): Promise<{lat: number, lng: number} | null> => {
+    return new Promise((resolve) => {
+      if (!("geolocation" in navigator)) {
+        resolve(null);
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        },
+        (err) => {
+          console.warn("Get current position on demand failed:", err.message);
+          resolve(null);
+        },
+        { enableHighAccuracy: true, timeout: 6000 }
+      );
+    });
+  };
+
+  const handleScan = async (scannedText: string) => {
+    if (!scannedText || logStatus === 'logging') return;
     
     setCameraMode('idle');
     setLogStatus('logging');
-    setStatusMessage('Validating QR Code...');
+    setStatusMessage('Validating QR Code & GPS coordinates...');
+    
+    // Acquire a high-accuracy fresh GPS lock
+    let latestLoc = userLocation;
+    try {
+      setStatusMessage('Acquiring high-accuracy GPS lock...');
+      const freshLoc = await getLatestUserLocation();
+      if (freshLoc) {
+        latestLoc = freshLoc;
+        setUserLocation(freshLoc);
+      }
+    } catch (gpsErr) {
+      console.warn("High accuracy GPS lookup failed:", gpsErr);
+    }
 
-    const scannedText = result[0].rawValue;
     let isValidTag = false;
 
     // Check if it's the old JSON format
@@ -103,27 +186,30 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
     }
 
     // Process Logging
-    let geoCompliance = 'NO GEOCODE';
+    let geoCompliance = 'NO GEOCODE ASSIGNED';
     let timingStatus = 'ON TIME';
 
     if (activeTab === 'ticket') {
        timingStatus = `TICKET: ${incidentType}`;
-       geoCompliance = incidentDesc.slice(0, 50);
-       if (userLocation) {
-         geoCompliance = `INCIDENT REPORTED`;
+       geoCompliance = `INCIDENT REPORTED: ${incidentDesc.slice(0, 40)}`;
+       if (latestLoc) {
+         geoCompliance += ` (Lat: ${latestLoc.lat.toFixed(6)}, Lng: ${latestLoc.lng.toFixed(6)})`;
        }
     } else {
-       // 1. Geocode
-       if (matchedLoc.geocode && userLocation) {
+       // 1. Geocode Compliance CHECK (within 50 meters)
+       if (matchedLoc.geocode && latestLoc) {
            const [targetLat, targetLng] = matchedLoc.geocode.split(',').map(n => parseFloat(n.trim()));
            if (!isNaN(targetLat) && !isNaN(targetLng)) {
-               const distMeters = calculateDistance(userLocation.lat, userLocation.lng, targetLat, targetLng);
-               geoCompliance = distMeters <= 50 ? 'WITHIN 50M' : 'OUTSIDE 50M';
+               const distMeters = calculateDistance(latestLoc.lat, latestLoc.lng, targetLat, targetLng);
+               const roundedDist = Math.round(distMeters * 10) / 10;
+               geoCompliance = distMeters <= 50 
+                 ? `COMPLIANT: WITHIN 50M (Distance: ${roundedDist}m, Lat: ${latestLoc.lat.toFixed(6)}, Lng: ${latestLoc.lng.toFixed(6)})` 
+                 : `NON-COMPLIANT: OUTSIDE 50M (Distance: ${roundedDist}m, Lat: ${latestLoc.lat.toFixed(6)}, Lng: ${latestLoc.lng.toFixed(6)})`;
            }
-       } else if (!userLocation) {
-           geoCompliance = 'LOCATION_SERVICES_DISABLED';
+       } else if (!latestLoc) {
+           geoCompliance = 'ERROR: LOCATION SERVICES DISABLED / TIMEOUT (Could not establish GPS lock)';
        }
-
+       
        // 2. Timing
        if (matchedLoc.timeToScan.length > 0) {
           const now = new Date();
@@ -178,15 +264,20 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
     try {
        setStatusMessage(`Uploading proof photo...`);
        let driveLink = '';
-       if (photoFile) {
-         const fileId = await uploadImageToDrive(photoFile, matchedLoc.subLocation.replace(/ /g, '_'));
+       const currentPhoto = photoFileRef.current;
+       if (currentPhoto) {
+         console.log('Found captured proof image to upload:', currentPhoto.name, currentPhoto.size);
+         const fileId = await uploadImageToDrive(currentPhoto, matchedLoc.subLocation.replace(/ /g, '_'));
          if (fileId.startsWith('/') || fileId.startsWith('http')) {
            driveLink = fileId.startsWith('http') ? fileId : `${window.location.origin}${fileId}`;
          } else {
            driveLink = `https://drive.google.com/open?id=${fileId}`;
          }
+       } else {
+         console.warn('No photoFileRef captured inside scan loop event closure!');
        }
        
+       setStatusMessage('Registering patrol logs in sheet...');
        await logPatrolToSheet(logData, driveLink);
 
        setStatusMessage(activeTab === 'ticket' ? `Ticket reported for ${matchedLoc.subLocation}` : `${matchedLoc.subLocation} scanned and logged!`);
@@ -293,7 +384,7 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
                   <textarea 
                     value={incidentDesc}
                     onChange={e => setIncidentDesc(e.target.value)}
-                    className="w-full h-24 bg-black border border-zinc-800 p-4 text-white focus:outline-none focus:border-red-500 transition-colors text-sm placeholder:text-zinc-700"
+                    className="w-full h-24 bg-black border border-zinc-800 p-4 text-white focus:outline-none focus:border-[#FBDF07] transition-colors text-sm placeholder:text-zinc-700"
                     placeholder="Describe what occurred..."
                   />
                 </div>
@@ -339,7 +430,7 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
                />
                <button 
                  onClick={capturePhoto} 
-                 className="absolute bottom-4 left-1/2 transform -translate-x-1/2 bg-white text-black px-6 py-3 rounded-full font-black uppercase text-xs tracking-widest z-10"
+                 className="absolute bottom-4 left-1/2 transform -translate-x-1/2 bg-white text-black px-6 py-3 rounded-full font-black uppercase text-xs tracking-widest z-10 font-sans"
                >
                  Take Photo
                </button>
@@ -355,21 +446,32 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
 
         {cameraMode === 'qr' && (
            <div className="w-full aspect-square bg-zinc-950 border border-zinc-800 overflow-hidden relative flex flex-col items-center justify-center p-2 mb-4">
-             <div className="w-full h-full border border-zinc-800 relative">
-               <QrScanner 
-                 onScan={handleScan}
-                 styles={{ container: { width: '100%', height: '100%' } }}
-                 components={{ audio: false, finder: false }}
+             <div className="w-full h-full border border-zinc-800 relative bg-black">
+               <CustomWebcam
+                 audio={false}
+                 ref={webcamRef}
+                 screenshotFormat="image/jpeg"
+                 videoConstraints={{ facingMode: "environment" }}
+                 className="w-full h-full object-cover"
                />
                <div className="absolute inset-0 border-2 border-[#FBDF07]/50 pointer-events-none m-8"></div>
                <div className="absolute top-4 left-4 border-t-4 border-l-4 border-[#FBDF07] w-12 h-12 pointer-events-none"></div>
                <div className="absolute top-4 right-4 border-t-4 border-r-4 border-[#FBDF07] w-12 h-12 pointer-events-none"></div>
                <div className="absolute bottom-4 left-4 border-b-4 border-l-4 border-[#FBDF07] w-12 h-12 pointer-events-none"></div>
-               <div className="absolute bottom-4 right-4 border-b-4 border-r-4 border-[#FBDF07] w-12 h-12 pointer-events-none"></div>
+               <div className="absolute bottom-4 right-4 border-[#FBDF07] border-b-4 border-r-4 w-12 h-12 pointer-events-none"></div>
                
+               <div className="absolute top-3 left-4 right-4 text-center z-10 flex flex-col gap-1">
+                 <span className="bg-black/95 px-3 py-1.5 text-[10px] font-bold uppercase text-[#FBDF07] tracking-widest border border-zinc-800">
+                   [ Align QR code inside the frame ]
+                 </span>
+                 <span className="text-[9px] text-zinc-400 font-bold tracking-widest uppercase">
+                   Real-time scan matches automatically
+                 </span>
+               </div>
+
                <button 
                  onClick={() => setCameraMode('idle')} 
-                 className="absolute top-4 right-4 bg-zinc-900/80 text-white px-4 py-2 font-bold uppercase text-[10px] tracking-widest z-10"
+                 className="absolute top-4 right-4 bg-zinc-900/85 text-white px-4 py-2 font-bold uppercase text-[10px] tracking-widest z-50 border border-zinc-800 cursor-pointer"
                >
                  Cancel
                </button>
@@ -387,7 +489,7 @@ export default function PatrolScanner({ activeGuard, locations }: Props) {
                   <p className="text-sm text-zinc-400">Photo attached to your ticket report.</p>
                   
                   <button onClick={() => {
-                    handleScan([{rawValue: "TICKET"}])
+                    handleScan("TICKET")
                   }} className="w-full mt-4 bg-red-500 text-white font-black uppercase text-xs tracking-widest py-4">
                      Submit Ticket
                   </button>

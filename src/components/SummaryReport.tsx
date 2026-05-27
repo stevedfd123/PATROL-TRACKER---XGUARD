@@ -85,7 +85,17 @@ export default function SummaryReport() {
   }
 
   const headers = logs.length > 0 ? logs[0] : ['TIMESTAMP', 'CSO', 'CSO NAME', 'MAIN LOCATION', 'SUB LOCATION', 'COMPLETED AMOUNT', 'GEOCODE COMPLIANCE', 'PROOF IMAGE'];
-  const rows = logs.length > 0 ? logs.slice(1) : [];
+  
+  const completedAmountIdx = headers.findIndex((h: string) => h && h.toUpperCase().includes('COMPLETED AMOUNT')) !== -1 
+    ? headers.findIndex((h: string) => h && h.toUpperCase().includes('COMPLETED AMOUNT')) 
+    : 5;
+    
+  // Exclude tickets and empty/null/undefined rows from standard patrol analytics
+  const rawRows = logs.length > 0 ? logs.slice(1) : [];
+  const rows = rawRows.filter(row => {
+    const val = row[completedAmountIdx];
+    return !(val && typeof val === 'string' && val.toUpperCase().startsWith('TICKET'));
+  });
 
   // Extract unique locations for filtering
   // Main Location is usually index 3 & Sub Location is index 4

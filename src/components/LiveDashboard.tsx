@@ -63,11 +63,18 @@ export default function LiveDashboard({ locations }: Props) {
       const headers = logs[0] || [];
       const subLocIdx = headers.findIndex((h: string) => h.toUpperCase().includes('SUB LOCATION')) !== -1 ? headers.findIndex((h: string) => h.toUpperCase().includes('SUB LOCATION')) : 4;
       const timeIdx = headers.findIndex((h: string) => h.toUpperCase().includes('TIMESTAMP')) !== -1 ? headers.findIndex((h: string) => h.toUpperCase().includes('TIMESTAMP')) : 0;
+      const completedAmountIdx = headers.findIndex((h: string) => h.toUpperCase().includes('COMPLETED AMOUNT')) !== -1 ? headers.findIndex((h: string) => h.toUpperCase().includes('COMPLETED AMOUNT')) : 5;
       
       for (let i = logs.length - 1; i >= 1; i--) {
-        if (logs[i][subLocIdx] === l.subLocation) {
-          lastScanned = logs[i][timeIdx];
-          lastScannedRow = logs[i];
+        const row = logs[i];
+        if (!row) continue;
+        const compVal = row[completedAmountIdx];
+        if (compVal && typeof compVal === 'string' && compVal.toUpperCase().startsWith('TICKET')) {
+          continue; // Ignore tickets for patrol scans
+        }
+        if (row[subLocIdx] === l.subLocation) {
+          lastScanned = row[timeIdx];
+          lastScannedRow = row;
           isRecentlyScanned = true; // Mark as scanned if it exists in logs at all
           break;
         }
@@ -103,12 +110,19 @@ export default function LiveDashboard({ locations }: Props) {
                           const subLocIdx = headers.findIndex((h: string) => h.toUpperCase().includes('SUB LOCATION')) !== -1 ? headers.findIndex((h: string) => h.toUpperCase().includes('SUB LOCATION')) : 4;
                           const timeIdx = headers.findIndex((h: string) => h.toUpperCase().includes('TIMESTAMP')) !== -1 ? headers.findIndex((h: string) => h.toUpperCase().includes('TIMESTAMP')) : 0;
                           
-                          for (let i = logs.length - 1; i >= 1; i--) {
-                            if (logs[i][subLocIdx] === s.subLocation) {
-                              subLastScanned = logs[i][timeIdx];
-                              break;
-                            }
-                          }
+                          const completedAmountIdx = headers.findIndex((h: string) => h.toUpperCase().includes('COMPLETED AMOUNT')) !== -1 ? headers.findIndex((h: string) => h.toUpperCase().includes('COMPLETED AMOUNT')) : 5;
+                           for (let i = logs.length - 1; i >= 1; i--) {
+                             const row = logs[i];
+                             if (!row) continue;
+                             const compVal = row[completedAmountIdx];
+                             if (compVal && typeof compVal === 'string' && compVal.toUpperCase().startsWith('TICKET')) {
+                               continue; // Ignore tickets for patrol scans
+                             }
+                             if (row[subLocIdx] === s.subLocation) {
+                               subLastScanned = row[timeIdx];
+                               break;
+                             }
+                           }
                           
                          return (
                          <div key={s.subLocation} className={`text-xs ${subLastScanned ? 'text-green-400' : 'text-zinc-400'} font-mono flex items-center justify-between border-b border-zinc-800/50 pb-2`}>
@@ -136,7 +150,7 @@ export default function LiveDashboard({ locations }: Props) {
                 zoomControl={false}
              >
                 <TileLayer
-                  url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+                  url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
                   attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
                 />
                 
@@ -170,22 +184,31 @@ export default function LiveDashboard({ locations }: Props) {
                                  LATEST SCAN DETAILS
                                </div>
                                <div className="text-[10px] text-zinc-300 font-mono grid grid-cols-[auto_1fr] gap-x-2 gap-y-1 mt-1">
-                                 <span className="text-zinc-500 uppercase">Time:</span>
-                                 <span>{loc.lastScanned}</span>
-                                 
-                                 <span className="text-zinc-500 uppercase">CSO:</span>
-                                 <span>{loc.lastScannedRow[1] || ''} - {loc.lastScannedRow[2] || ''}</span>
-                                 
-                                 <span className="text-zinc-500 uppercase">Geo:</span>
-                                 <span className={loc.lastScannedRow[6]?.includes('ON TIME') ? 'text-green-500' : 'text-red-500'}>
-                                   {loc.lastScannedRow[6] || 'N/A'}
-                                 </span>
-                                 
-                                 <span className="text-zinc-500 uppercase">Time:</span>
-                                 <span className={loc.lastScannedRow[7]?.includes('ON TIME') ? 'text-green-500' : 'text-red-500'}>
-                                   {loc.lastScannedRow[7] || 'N/A'}
-                                 </span>
-                               </div>
+                                  <span className="text-zinc-500 uppercase">Time:</span>
+                                  <span>{loc.lastScanned}</span>
+                                  
+                                  <span className="text-zinc-500 uppercase">Timing:</span>
+                                  <span className={loc.lastScannedRow[5]?.startsWith('ON TIME') ? 'text-green-400' : 'text-[#FBDF07]'}>
+                                    {loc.lastScannedRow[5] || 'N/A'}
+                                  </span>
+
+                                  <span className="text-zinc-500 uppercase">CSO:</span>
+                                  <span>{loc.lastScannedRow[1] || ''} - {loc.lastScannedRow[2] || ''}</span>
+                                  
+                                  <span className="text-zinc-500 uppercase">GPS Geo:</span>
+                                  <span className={loc.lastScannedRow[6]?.includes('COMPLIANT') ? 'text-green-400' : 'text-red-400'}>
+                                    {loc.lastScannedRow[6] || 'N/A'}
+                                  </span>
+                                  
+                                  {loc.lastScannedRow[7] && (
+                                    <>
+                                      <span className="text-zinc-500 uppercase">Photo:</span>
+                                      <a href={loc.lastScannedRow[7]} target="_blank" rel="noreferrer" className="text-[#FBDF07] hover:underline font-bold uppercase text-[9px]">
+                                        View Proof Photo
+                                      </a>
+                                    </>
+                                  )}
+                                </div>
                              </div>
                            ) : (
                              <div className="mt-2 text-[10px] text-red-500 font-mono animate-pulse">

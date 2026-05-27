@@ -35,6 +35,21 @@ async function startServer() {
   }
   loadStoredToken();
 
+  function getActiveSpreadsheetId(): string {
+    try {
+      const idPath = path.join(process.cwd(), 'spreadsheet-id.json');
+      if (fs.existsSync(idPath)) {
+        const data = JSON.parse(fs.readFileSync(idPath, 'utf-8'));
+        if (data && data.spreadsheetId) {
+          return data.spreadsheetId.trim();
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to read server-side spreadsheet-id.json:', error);
+    }
+    return '1MaGvmF9o6Zh9p61ej7AR2MXyv6pZfkOLRtt08KAxpfU'; // DEFAULT_SPREADSHEET_ID
+  }
+
   // Health check
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok' });
@@ -68,7 +83,9 @@ async function startServer() {
   });
 
   app.post('/api/sheets/append', async (req, res) => {
-    const { spreadsheetId, range, values } = req.body;
+    let { spreadsheetId, range, values } = req.body;
+    const activeId = getActiveSpreadsheetId();
+    spreadsheetId = activeId || spreadsheetId;
     if (!spreadsheetId || !range || !values) {
       return res.status(400).json({ error: 'Missing spreadsheetId, range, or values' });
     }
@@ -100,7 +117,24 @@ async function startServer() {
     let webhookNotes = '';
     try {
       const webhookUrl = 'https://script.google.com/macros/s/AKfycbwjew3zDwnx2c3dzGalfXdl-0qpwVrweeUgmvPaCpK3c7sR5a07plKxS8hYHTZmsik/exec';
-      const webhookPayload = {
+      
+      let base64OfUploadedImage = '';
+      const providedImgUrl = values[0]?.[7] || '';
+      if (providedImgUrl && (providedImgUrl.includes('/uploads/') || providedImgUrl.includes('localhost') || providedImgUrl.includes('.run.app'))) {
+        try {
+          const uparts = providedImgUrl.split('/uploads/');
+          const filename = uparts[uparts.length - 1];
+          const localPath = path.join(process.cwd(), 'uploads', filename);
+          if (fs.existsSync(localPath)) {
+            base64OfUploadedImage = fs.readFileSync(localPath).toString('base64');
+            console.log(`Successfully converted locally stored image ${filename} to base64 for webhook.`);
+          }
+        } catch (fileErr) {
+          console.warn('Failed to convert local uploaded image to base64 for webhook:', fileErr);
+        }
+      }
+
+      const webhookPayload: any = {
         spreadsheetId,
         range,
         values,
@@ -115,6 +149,13 @@ async function startServer() {
         imageUrl: values[0]?.[7] || '',
         proofImage: values[0]?.[7] || ''
       };
+
+      if (base64OfUploadedImage) {
+        webhookPayload.base64Image = base64OfUploadedImage;
+        webhookPayload.base64Data = base64OfUploadedImage;
+        webhookPayload.imageName = values[0]?.[4] ? `${values[0][4].replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.jpg` : `patrol_${Date.now()}.jpg`;
+        webhookPayload.mimeType = 'image/jpeg';
+      }
 
       console.log('Posting log data to centralized Webhook:', webhookUrl);
       const webhookRes = await fetch(webhookUrl, {
@@ -132,6 +173,18 @@ async function startServer() {
       if (webhookRes.ok) {
         webhookSuccess = true;
         webhookNotes = 'Saved successfully to sheet via central webhook link.';
+        
+        // If the webhook reports a drive file url or specific ID, try scanning for it
+        try {
+          const parsedRes = JSON.parse(resText);
+          if (parsedRes.url || parsedRes.fileUrl) {
+            const driveLink = parsedRes.url || parsedRes.fileUrl;
+            console.log('Apps Script returned custom Google Drive image URL:', driveLink);
+            // Replace the local URL with the real Google Drive URL in our values for downstream (backup/local sheets)
+            values[0][7] = driveLink;
+            webhookNotes += ` Real-Time Drive Image Link locked: ${driveLink}`;
+          }
+        } catch {}
       } else {
         webhookNotes = `Webhook returned HTTP ${webhookRes.status}: ${resText}`;
       }
@@ -178,7 +231,9 @@ async function startServer() {
   });
 
   app.get('/api/sheets/values', async (req, res) => {
-    const { spreadsheetId, range } = req.query;
+    let { spreadsheetId, range } = req.query;
+    const activeId = getActiveSpreadsheetId();
+    spreadsheetId = activeId || (spreadsheetId as string);
     if (!spreadsheetId || !range) {
       return res.status(400).json({ error: 'Missing spreadsheetId or range parameter' });
     }
@@ -224,28 +279,55 @@ async function startServer() {
         const csvUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
         const csvResponse = await fetch(csvUrl);
         if (csvResponse.ok) {
+          const contentType = csvResponse.headers.get('content-type') || '';
+          if (contentType.includes('html')) {
+            throw new Error('CSV fallback returned HTML pages (probably sign-in page for private sheet).');
+          }
           const csvText = await csvResponse.text();
+          if (csvText.startsWith('<!DOCTYPE html') || csvText.includes('<html')) {
+            throw new Error('CSV fallback returned HTML content (probably sign-in page for private sheet).');
+          }
+
+          // Robust RFC 4180 character-by-character CSV parsing strategy
           const rows: any[][] = [];
-          const lines = csvText.split(/\r?\n/);
-          for (const line of lines) {
-            if (!line.trim()) continue;
+          let row: string[] = [];
+          let cell = '';
+          let inQuotes = false;
+          
+          for (let i = 0; i < csvText.length; i++) {
+            const char = csvText[i];
+            const nextChar = csvText[i + 1];
             
-            const parts: string[] = [];
-            let current = '';
-            let inQuotes = false;
-            for (let i = 0; i < line.length; i++) {
-              const char = line[i];
-              if (char === '"') {
-                inQuotes = !inQuotes;
-              } else if (char === ',' && !inQuotes) {
-                parts.push(parts.length === 7 ? current : current.trim());
-                current = '';
+            if (char === '"') {
+              if (inQuotes && nextChar === '"') {
+                // Escaped double quote inside a quoted cell
+                cell += '"';
+                i++; // skip next quote
               } else {
-                current += char;
+                // Toggle quote state
+                inQuotes = !inQuotes;
               }
+            } else if (char === ',' && !inQuotes) {
+              row.push(row.length === 7 ? cell : cell.trim());
+              cell = '';
+            } else if ((char === '\r' || char === '\n') && !inQuotes) {
+              if (char === '\r' && nextChar === '\n') {
+                i++; // skip \n
+              }
+              row.push(row.length === 7 ? cell : cell.trim());
+              if (row.length > 1 || (row.length === 1 && row[0] !== '')) {
+                rows.push(row);
+              }
+              row = [];
+              cell = '';
+            } else {
+              cell += char;
             }
-            parts.push(current.trim());
-            rows.push(parts);
+          }
+          // Handle trailing cell/row if missing final line terminator
+          if (cell !== '' || row.length > 0) {
+            row.push(row.length === 7 ? cell : cell.trim());
+            rows.push(row);
           }
           if (rows.length > 0) {
             sheetValues = rows;
@@ -269,24 +351,34 @@ async function startServer() {
       console.warn('Could not read local logs for merge:', e);
     }
 
-    if (String(range).toUpperCase().includes('LOG')) {
-      if (sheetValues.length === 0) {
-        sheetValues = [['TIMESTAMP', 'CSO', 'CSO NAME', 'MAIN LOCATION', 'SUB LOCATION', 'COMPLETED AMOUNT', 'GEOCODE COMPLIANCE', 'PROOF IMAGE']];
-      }
-
-      const existingTimestamps = new Set(sheetValues.map(row => row[0]));
-      for (const log of localLogs) {
-        if (Array.isArray(log) && log.length >= 7) {
-          if (!existingTimestamps.has(log[0])) {
-            sheetValues.push(log);
-          }
-        }
-      }
+    if (sheetValues.length === 0) {
+      sheetValues = [['TIMESTAMP', 'CSO', 'CSO NAME', 'MAIN LOCATION', 'SUB LOCATION', 'COMPLETED AMOUNT', 'GEOCODE COMPLIANCE', 'PROOF IMAGE']];
     }
 
-    if (sheetValues.length === 0) {
-      if (String(range).toUpperCase().includes('LOG')) {
-        sheetValues = [['TIMESTAMP', 'CSO', 'CSO NAME', 'MAIN LOCATION', 'SUB LOCATION', 'COMPLETED AMOUNT', 'GEOCODE COMPLIANCE', 'PROOF IMAGE']];
+    const existingKeys = new Set(
+      sheetValues.map(row => {
+        const ts = String(row[0] || '').trim();
+        const cso = String(row[1] || '').trim().toLowerCase();
+        const sub = String(row[4] || '').trim().toLowerCase();
+        return `${ts}|${cso}|${sub}`;
+      })
+    );
+
+    for (const log of localLogs) {
+      if (Array.isArray(log) && log.length >= 7) {
+        const ts = String(log[0] || '').trim();
+        const cso = String(log[1] || '').trim().toLowerCase();
+        const sub = String(log[4] || '').trim().toLowerCase();
+        const key = `${ts}|${cso}|${sub}`;
+
+        if (!existingKeys.has(key)) {
+          const paddedLog = [...log];
+          while (paddedLog.length < 8) {
+            paddedLog.push('');
+          }
+          sheetValues.push(paddedLog);
+          existingKeys.add(key);
+        }
       }
     }
 
@@ -305,8 +397,30 @@ async function startServer() {
     }
   });
 
-  app.post('/api/sheets/resolve-title', async (req, res) => {
+  app.get('/api/sheets/spreadsheet-id', (req, res) => {
+    return res.json({ spreadsheetId: getActiveSpreadsheetId() });
+  });
+
+  app.post('/api/sheets/save-spreadsheet-id', (req, res) => {
     const { spreadsheetId } = req.body;
+    if (!spreadsheetId) {
+      return res.status(400).json({ error: 'Missing spreadsheetId parameter' });
+    }
+    try {
+      const idPath = path.join(process.cwd(), 'spreadsheet-id.json');
+      fs.writeFileSync(idPath, JSON.stringify({ spreadsheetId: spreadsheetId.trim() }, null, 2));
+      console.log('Global spreadsheet ID saved successfully on server:', spreadsheetId);
+      return res.json({ status: 'ok', spreadsheetId: spreadsheetId.trim() });
+    } catch (error: any) {
+      console.error('Failed to save global spreadsheet ID on server:', error);
+      return res.status(500).json({ error: error.message || 'Failed to save global spreadsheet ID' });
+    }
+  });
+
+  app.post('/api/sheets/resolve-title', async (req, res) => {
+    let { spreadsheetId } = req.body;
+    const activeId = getActiveSpreadsheetId();
+    spreadsheetId = activeId || spreadsheetId;
     if (!spreadsheetId) {
       return res.status(400).json({ error: 'Missing spreadsheetId parameter' });
     }
@@ -346,6 +460,75 @@ async function startServer() {
       const host = req.headers['x-forwarded-host'] || req.get('host');
       const absoluteUrl = `${protocol}://${host}/uploads/${safeName}`;
 
+      // Try direct Google Drive upload if we have an access token
+      if (currentAccessToken) {
+        try {
+          console.log('Access token present on the server. Attempting direct upload to Google Drive catalog...');
+          
+          const metadata = {
+            name: safeName,
+            mimeType: mimeType
+          };
+          const boundary = '-------314159265358979323846';
+          const delimiter = `\r\n--${boundary}\r\n`;
+          const close_delim = `\r\n--${boundary}--`;
+          
+          const multipartBody = delimiter +
+            'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+            JSON.stringify(metadata) +
+            delimiter +
+            'Content-Type: ' + mimeType + '\r\n' +
+            'Content-Transfer-Encoding: base64\r\n\r\n' +
+            base64Data +
+            close_delim;
+
+          const driveResponse = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${currentAccessToken}`,
+              'Content-Type': `multipart/related; boundary=${boundary}`
+            },
+            body: multipartBody
+          });
+
+          if (driveResponse.ok) {
+            const driveData = await driveResponse.json();
+            const fileId = driveData.id;
+            console.log('Direct Google Drive upload succeeded. File ID:', fileId);
+
+            // Set file read permission so sheets can view it
+            try {
+              await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/permissions`, {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${currentAccessToken}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  role: 'reader',
+                  type: 'anyone'
+                })
+              });
+              console.log('Succesfully made Google Drive uploaded file readable by anyone.');
+            } catch (permissionErr) {
+              console.warn('Could not set readable permissions on Drive file:', permissionErr);
+            }
+
+            const driveUrl = `https://drive.google.com/uc?export=view&id=${fileId}`;
+            return res.json({
+              id: fileId,
+              fallback: false,
+              url: driveUrl
+            });
+          } else {
+            const driveErrText = await driveResponse.text();
+            console.error('Google Drive direct upload request failed. Fallback to local url serving details:', driveErrText);
+          }
+        } catch (driveApiErr: any) {
+          console.error('Google Drive direct upload API exception:', driveApiErr.message || driveApiErr);
+        }
+      }
+
       return res.json({
         id: absoluteUrl,
         fallback: false,
@@ -354,6 +537,54 @@ async function startServer() {
     } catch (err: any) {
       console.error('Failed to save image locally:', err);
       return res.status(500).json({ error: err.message || 'Failed to save image locally' });
+    }
+  });
+
+  // GET /api/tickets - Fetch all ticket status overriding metadata (e.g., pending/resolved status & comments)
+  app.get('/api/tickets', (req, res) => {
+    const ticketsPath = path.join(process.cwd(), 'local-tickets.json');
+    let ticketsData = {};
+    try {
+      if (fs.existsSync(ticketsPath)) {
+        ticketsData = JSON.parse(fs.readFileSync(ticketsPath, 'utf-8'));
+      }
+    } catch (e: any) {
+      console.warn('Could not read local tickets database:', e.message);
+    }
+    return res.json(ticketsData);
+  });
+
+  // POST /api/tickets/update - Update status & comment for a ticket
+  app.post('/api/tickets/update', (req, res) => {
+    const { ticketId, status, comment, updatedBy } = req.body;
+    if (!ticketId) {
+      return res.status(400).json({ error: 'Missing ticketId parameter' });
+    }
+
+    const ticketsPath = path.join(process.cwd(), 'local-tickets.json');
+    let ticketsData: Record<string, any> = {};
+    try {
+      if (fs.existsSync(ticketsPath)) {
+        ticketsData = JSON.parse(fs.readFileSync(ticketsPath, 'utf-8'));
+      }
+    } catch (e: any) {
+      console.warn('Could not read local tickets database for update:', e.message);
+    }
+
+    ticketsData[ticketId] = {
+      status: status || 'Pending',
+      comment: comment || '',
+      updatedBy: updatedBy || 'Admin',
+      updatedAt: new Date().toISOString()
+    };
+
+    try {
+      fs.writeFileSync(ticketsPath, JSON.stringify(ticketsData, null, 2), 'utf-8');
+      console.log(`Updated ticket ${ticketId} status to ${status} and saved.`);
+      return res.json({ status: 'ok', ticket: ticketsData[ticketId] });
+    } catch (error: any) {
+      console.error('Failed to write local tickets registry:', error);
+      return res.status(500).json({ error: error.message || 'Failed to update ticket' });
     }
   });
 
