@@ -31,8 +31,12 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build
-        run: npm run build
+      # 🔥 FORCE correct Vite root context
+      - name: Build Vite app
+        run: npx vite build
+
+      - name: Verify build output
+        run: ls -R dist
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -40,7 +44,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ./dist
+          path: dist
 
       - name: Deploy
         uses: actions/deploy-pages@v4
